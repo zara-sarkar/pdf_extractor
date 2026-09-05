@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional, List
 import click
 from nano_extractor.core import NanoPDFExtractor
+from nano_extractor.storage import LocalStorageProvider, S3StorageProvider
 
 
 def parse_page_numbers(pages_str: str) -> List[int]:
@@ -70,12 +71,58 @@ def parse_page_numbers(pages_str: str) -> List[int]:
     default=None, 
     help="Output file prefix/path (without extensions). Defaults to 'test_results/<pdf_name>_extracted'."
 )
+@click.option(
+    "--storage", "-s",
+    type=click.Choice(["local", "s3"], case_sensitive=False),
+    default="local",
+    show_default=True,
+    help="Storage provider backend for saved figure crops."
+)
+@click.option(
+    "--local-dir",
+    type=str,
+    default="output",
+    show_default=True,
+    help="Directory for local image storage (used when --storage is 'local')."
+)
+@click.option(
+    "--s3-bucket",
+    type=str,
+    default=None,
+    help="S3 bucket name (required when --storage is 's3')."
+)
+@click.option(
+    "--s3-prefix",
+    type=str,
+    default="crops",
+    show_default=True,
+    help="Key prefix/folder path inside S3 bucket."
+)
+@click.option(
+    "--s3-region",
+    type=str,
+    default=None,
+    help="AWS region name for S3 bucket (optional)."
+)
+@click.option(
+    "--model",
+    type=str,
+    default="gemini-2.5-flash",
+    show_default=True,
+    help="Gemini vision model identifier."
+)
 def cli(
     pdf_path: Path, 
     pages: Optional[str], 
     mode: str, 
     format: str, 
-    out: Optional[str]
+    out: Optional[str],
+    storage: str,
+    local_dir: str,
+    s3_bucket: Optional[str],
+    s3_prefix: str,
+    s3_region: Optional[str],
+    model: str
 ) -> None:
     """Extract text, footnotes, tables, and OpenCV-detected visual figures from PDFs.
 
@@ -91,16 +138,36 @@ def cli(
         output_prefix = str(out_dir / f"{pdf_path.stem}_extracted")
     else:
         output_prefix = out
-        # Ensure parent directory of custom prefix exists
         Path(output_prefix).parent.mkdir(parents=True, exist_ok=True)
+
+    # Initialize Storage Provider
+    if storage.lower() == "s3":
+        if not s3_bucket:
+            raise click.BadParameter("The '--s3-bucket' option is required when '--storage s3' is selected.")
+        
+        storage_provider = S3StorageProvider(
+            bucket_name=s3_bucket,
+            prefix=s3_prefix,
+            region_name=s3_region
+        )
+        storage_info = f"S3 (s3://{s3_bucket}/{s3_prefix})"
+    else:
+        storage_provider = LocalStorageProvider(base_dir=local_dir)
+        storage_info = f"Local ({Path(local_dir).resolve()})"
 
     click.secho(f"📄 Processing: {pdf_path.name}", fg="cyan", bold=True)
     click.echo(f"  ├─ Mode: {mode.upper()}")
     click.echo(f"  ├─ Format: {format.upper()}")
+    click.echo(f"  ├─ Storage: {storage_info}")
+    click.echo(f"  ├─ Model: {model}")
     click.echo(f"  └─ Target Pages: {pages if pages else 'All'}")
 
     try:
-        extractor = NanoPDFExtractor()
+        extractor = NanoPDFExtractor(
+            model_name=model,
+            storage_provider=storage_provider
+        )
+        
         extracted_data = extractor.process_pdf(
             pdf_path=str(pdf_path), 
             pages=page_list, 
@@ -113,7 +180,7 @@ def cli(
             output_prefix=output_prefix
         )
 
-        click.secho(f" Successfully exported to: '{output_prefix}.*'", fg="green", bold=True)
+        click.secho(f"✨ Successfully exported to: '{output_prefix}.*'", fg="green", bold=True)
 
     except Exception as err:
         click.secho(f"❌ Error during extraction: {err}", fg="red", err=True)
