@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 from io import BytesIO
 from pathlib import Path
 from typing import Literal, Dict, Any, List, Tuple, Optional
@@ -9,6 +10,7 @@ import pymupdf  # PyMuPDF engine
 import pdfplumber
 from pdf2image import convert_from_path
 from PIL import Image
+import onnxruntime as ort
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -22,28 +24,86 @@ from nano_extractor.storage import BaseStorageProvider, LocalStorageProvider
 load_dotenv()
 
 
-class NanoPDFExtractor:
-    """A hierarchical hybrid PDF extraction module combining vector text parsing and computer vision.
+class MLLayoutDetector:
+    """Layer 3: ONNX-based DocLayout-YOLO engine for ML document layout analysis."""
 
-    Uses `pymupdf` (PyMuPDF) as Layer 1 for ultra-fast text/block layout extraction, `pdfplumber`
-    as Layer 2 for deterministic grid table reconstruction, OpenCV layout heuristics as Layer 3
-    for secondary visual DLA bounding-box isolation, and Gemini 2.5 Flash as Layer 4 for multimodal
-    interpretation of charts, graphs, and complex diagrams.
+    CLASSES = ["Text", "Title", "Header", "Footer", "Figure", "Table", "Equation"]
+
+    def __init__(self, model_path: Optional[str] = "models/doclayout_yolo.onnx"):
+        self.session = None
+        if model_path and os.path.exists(model_path):
+            try:
+                self.session = ort.InferenceSession(
+                    model_path, 
+                    providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+                )
+            except Exception as e:
+                print(f"[Warning] Failed to load ML model: {e}. Falling back to OpenCV heuristics.")
+
+    def detect_layout(self, pil_image: Image.Image, conf_threshold: float = 0.35) -> List[Dict[str, Any]]:
+        """Executes ML inference on a rendered page image to identify document elements."""
+        if not self.session:
+            return []
+
+        # Resize image for standard object detection model input
+        img_w, img_h = pil_image.size
+        resized = pil_image.resize((640, 640))
+        img_data = np.array(resized).astype(np.float32) / 255.0
+        img_data = np.transpose(img_data, (2, 0, 1))  # HWC to CHW
+        input_tensor = np.expand_dims(img_data, axis=0)
+
+        input_name = self.session.get_inputs()[0].name
+        outputs = self.session.run(None, {input_name: input_tensor})
+
+        detected_regions = []
+        # Expecting tensor shape [1, N, 6] -> (x1, y1, x2, y2, conf, class_id)
+        if len(outputs) > 0 and len(outputs[0]) > 0:
+            for pred in outputs[0][0]:
+                if len(pred) < 6:
+                    continue
+                score = float(pred[4])
+                if score < conf_threshold:
+                    continue
+
+                cls_id = int(pred[5])
+                label = self.CLASSES[cls_id] if cls_id < len(self.CLASSES) else "Figure"
+
+                # Scale coordinates back to original image dimensions
+                x1 = int((pred[0] / 640.0) * img_w)
+                y1 = int((pred[1] / 640.0) * img_h)
+                x2 = int((pred[2] / 640.0) * img_w)
+                y2 = int((pred[3] / 640.0) * img_h)
+
+                w = max(1, x2 - x1)
+                h = max(1, y2 - y1)
+
+                detected_regions.append({
+                    "label": label,
+                    "bbox": (x1, y1, w, h),
+                    "confidence": score
+                })
+
+        return detected_regions
+
+
+class NanoPDFExtractor:
+    """A 5-layer hierarchical hybrid PDF extraction pipeline.
+
+    - Layer 1: PyMuPDF (pymupdf) -> Ultra-fast block text extraction
+    - Layer 2: pdfplumber -> Deterministic grid table parsing
+    - Layer 3: DocLayout-YOLO (ONNX) -> ML-driven layout region classification
+    - Layer 4: OpenCV -> Boundary contour refinement & secondary edge heuristics
+    - Layer 5: Gemini 2.5 Flash -> Multimodal vision analysis of isolated visual crops
     """
 
     def __init__(
         self, 
         api_key: Optional[str] = None, 
         model_name: str = "gemini-2.5-flash",
-        storage_provider: Optional[BaseStorageProvider] = None
+        layout_model_path: Optional[str] = "models/doclayout_yolo.onnx",
+        storage_provider: Optional[BaseStorageProvider] = None,
+        embed_base64: bool = True
     ):
-        """Initializes the NanoPDFExtractor with GenAI API credentials and storage backend.
-
-        Args:
-            api_key: Gemini API key. Defaults to environment variable GEMINI_API_KEY or gemini_key.
-            model_name: Vision LLM model identifier. Defaults to 'gemini-2.5-flash'.
-            storage_provider: Abstract storage provider for cropped figures. Defaults to LocalStorageProvider.
-        """
         resolved_key = (
             api_key 
             or os.environ.get("GEMINI_API_KEY") 
@@ -53,6 +113,50 @@ class NanoPDFExtractor:
         self.client = genai.Client(api_key=resolved_key)
         self.model_name = model_name
         self.storage = storage_provider or LocalStorageProvider()
+        self.embed_base64 = embed_base64
+        
+        # Layer 3 ML Layout Model
+        self.ml_detector = MLLayoutDetector(model_path=layout_model_path)
+
+    @staticmethod
+    def _image_to_base64(pil_img: Image.Image) -> str:
+        """Helper to serialize PIL images as Base64 Data URIs."""
+        buffered = BytesIO()
+        pil_img.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        return f"data:image/png;base64,{img_str}"
+
+    def refine_bbox_with_opencv(
+        self, 
+        pil_image: Image.Image, 
+        ml_bbox: Tuple[int, int, int, int]
+    ) -> Tuple[int, int, int, int]:
+        """Layer 4: Refines and snaps ML bounding boxes tightly around actual inner contours."""
+        x, y, w, h = ml_bbox
+        img_w, img_h = pil_image.size
+        
+        crop = pil_image.crop((x, y, x + w, y + h))
+        cv_img = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+        
+        _, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return ml_bbox
+
+        min_x = min([cv2.boundingRect(c)[0] for c in contours])
+        min_y = min([cv2.boundingRect(c)[1] for c in contours])
+        max_r = max([cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] for c in contours])
+        max_b = max([cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] for c in contours])
+
+        margin = 8
+        ref_x = max(0, x + min_x - margin)
+        ref_y = max(0, y + min_y - margin)
+        ref_w = min(img_w - ref_x, (max_r - min_x) + (margin * 2))
+        ref_h = min(img_h - ref_y, (max_b - min_y) + (margin * 2))
+
+        return (ref_x, ref_y, ref_w, ref_h)
 
     def detect_chart_bounding_boxes(
         self, 
@@ -60,16 +164,7 @@ class NanoPDFExtractor:
         min_area_ratio: float = 0.02, 
         max_area_ratio: float = 0.85
     ) -> List[Tuple[int, int, int, int]]:
-        """Detects potential chart, graph, or figure regions in an image using OpenCV heuristics (Layer 3 DLA).
-
-        Args:
-            pil_image: Target rendered page image.
-            min_area_ratio: Minimum area fraction relative to total page area to qualify as a figure.
-            max_area_ratio: Maximum area fraction relative to total page area to filter full-page containers.
-
-        Returns:
-            List of bounding box tuples in (x, y, w, h) format.
-        """
+        """Layer 4 Fallback: OpenCV edge heuristics for visual region detection."""
         open_cv_image = np.array(pil_image)
         open_cv_image = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2BGR)
         
@@ -81,7 +176,6 @@ class NanoPDFExtractor:
             gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
         )
 
-        # Morphological structuring element to group graphical visual structures
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
         dilated = cv2.dilate(binary, kernel, iterations=1)
 
@@ -93,7 +187,6 @@ class NanoPDFExtractor:
             box_area = w * h
             aspect_ratio = float(w) / h
 
-            # Filter out ultra-wide text banners or tall vertical margins
             if aspect_ratio > 4.0 or aspect_ratio < 0.25:
                 continue
 
@@ -102,7 +195,6 @@ class NanoPDFExtractor:
                 edges = cv2.Canny(roi, 50, 150)
                 edge_density = np.sum(edges > 0) / float(w * h)
 
-                # Lowered density threshold to capture clean/sparse vector diagrams
                 if edge_density > 0.015:
                     margin = 10
                     x_m = max(0, x - margin)
@@ -114,29 +206,29 @@ class NanoPDFExtractor:
         return bounding_boxes
 
     def _extract_page_text_pymupdf(self, pymupdf_page: pymupdf.Page) -> List[Dict[str, Any]]:
-        """Layer 1: Extracts structured text blocks directly via PyMuPDF (pymupdf) C-engine."""
+        """Layer 1: Fast block text extraction using PyMuPDF."""
         blocks = pymupdf_page.get_text("blocks")
         text_blocks = []
         
         for b in blocks:
-            # b tuple format: (x0, y0, x1, y1, "text", block_no, block_type)
-            # block_type 0 = text, 1 = image
             text_content = b[4].strip()
             if text_content and b[6] == 0:
                 text_blocks.append({
                     "bbox": [round(b[0], 2), round(b[1], 2), round(b[2], 2), round(b[3], 2)],
-                    "text": text_content
+                    "text": text_content,
+                    "type": "text"
                 })
                 
         return text_blocks
 
-    def _extract_native_tables_plumber(self, plumber_page: pdfplumber.page.Page) -> List[str]:
-        """Layer 2: Extracts native vector grid tables via pdfplumber into Markdown tables."""
-        tables = plumber_page.extract_tables()
-        md_tables = []
+    def _extract_native_tables_plumber(self, plumber_page: pdfplumber.page.Page) -> List[Dict[str, Any]]:
+        """Layer 2: Extract vector tables via pdfplumber into Markdown strings with bounding box."""
+        tables = plumber_page.find_tables()
+        extracted_tables = []
         
-        for table in tables:
-            clean_table = [[str(cell or "").strip() for cell in row] for row in table if any(row)]
+        for t in tables:
+            raw_table = t.extract()
+            clean_table = [[str(cell or "").strip() for cell in row] for row in raw_table if any(row)]
             if len(clean_table) > 1:
                 header = clean_table[0]
                 rows = clean_table[1:]
@@ -145,9 +237,14 @@ class NanoPDFExtractor:
                 md_str += "| " + " | ".join(["---"] * len(header)) + " |\n"
                 for row in rows:
                     md_str += "| " + " | ".join(row) + " |\n"
-                md_tables.append(md_str)
                 
-        return md_tables
+                extracted_tables.append({
+                    "bbox": list(t.bbox),
+                    "markdown": md_str,
+                    "type": "native_table"
+                })
+                
+        return extracted_tables
 
     @retry(
         reraise=True,
@@ -156,7 +253,7 @@ class NanoPDFExtractor:
         retry=retry_if_exception_type(APIError)
     )
     def _analyze_image_patch_with_nano(self, image_patch: Image.Image, prompt: str) -> str:
-        """Layer 4: Sends an isolated visual crop to Gemini 2.5 Flash with retry handling."""
+        """Layer 5: Analyze image crop with Gemini 2.5 Flash."""
         system_instruction = (
             "You are an expert document extraction system. "
             "Your task is to analyze the image crop and extract structured visual information:\n"
@@ -186,16 +283,7 @@ class NanoPDFExtractor:
         pages: Optional[List[int]] = None, 
         extract_mode: Literal["text", "hybrid"] = "hybrid"
     ) -> Dict[str, Any]:
-        """Hierarchical pipeline processing target PDF pages.
-
-        Args:
-            pdf_path: Path to the target PDF file.
-            pages: Zero-indexed list of page numbers to process. If None, processes all pages.
-            extract_mode: 'text' for rapid vector text parsing, or 'hybrid' to activate DLA & Vision LLM.
-
-        Returns:
-            Dict containing per-page hierarchical extraction structures.
-        """
+        """Executes the 5-layer pipeline on target PDF pages."""
         results = {"pages": []}
         pdf_stem = Path(pdf_path).stem
         
@@ -235,14 +323,21 @@ class NanoPDFExtractor:
                     "page_number": page_idx + 1, 
                     "text": combined_text,
                     "text_blocks": text_blocks,
-                    "native_tables": native_tables,
+                    "native_tables": [t["markdown"] for t in native_tables],
                     "visual_analysis": []
                 }
                 
-                # Layer 3 & 4: OpenCV DLA + Gemini Vision Analysis
+                # Layer 3, 4 & 5: ML + OpenCV + Gemini Analysis
                 if extract_mode == "hybrid" and page_idx in page_images_map:
                     page_img = page_images_map[page_idx]
-                    chart_boxes = self.detect_chart_bounding_boxes(page_img)
+                    
+                    # Layer 3: ML Layout Detection
+                    ml_regions = self.ml_detector.detect_layout(page_img)
+                    figure_boxes = [r["bbox"] for r in ml_regions if r["label"] in ["Figure", "Table", "Equation"]]
+                    
+                    # Layer 4 Fallback: Use OpenCV heuristics if ML session is not available
+                    if not figure_boxes and not self.ml_detector.session:
+                        figure_boxes = self.detect_chart_bounding_boxes(page_img)
                     
                     prompt = (
                         "Analyze this image crop. "
@@ -251,23 +346,30 @@ class NanoPDFExtractor:
                     )
                     
                     fig_counter = 1
-                    for box_idx, (x, y, w, h) in enumerate(chart_boxes):
+                    for box_idx, ml_box in enumerate(figure_boxes):
+                        refined_bbox = self.refine_bbox_with_opencv(page_img, ml_box)
+                        x, y, w, h = refined_bbox
+                        
                         crop = page_img.crop((x, y, x + w, y + h))
                         
+                        # Layer 5: Gemini Multimodal Analysis
                         analysis = self._analyze_image_patch_with_nano(crop, prompt)
                         
-                        # Filter out non-graph crops flagged by Gemini Vision
                         if "NO_GRAPH" in analysis.strip():
                             continue
 
-                        # Persist image via storage adapter
-                        rel_key = f"crops/{pdf_stem}/p{page_idx + 1}_fig{fig_counter}.png"
-                        image_uri = self.storage.save_image(crop, rel_key)
+                        # Extract image URI (Base64 data URI by default, or storage relative path)
+                        if self.embed_base64:
+                            image_uri = self._image_to_base64(crop)
+                        else:
+                            rel_key = f"crops/{pdf_stem}/p{page_idx + 1}_fig{fig_counter}.png"
+                            image_uri = self.storage.save_image(crop, rel_key)
                         
                         page_data["visual_analysis"].append({
                             "figure_index": fig_counter,
                             "bbox": [x, y, w, h],
                             "image_path": image_uri,
+                            "type": "visual_figure",
                             "data": analysis
                         })
                         fig_counter += 1
@@ -278,13 +380,7 @@ class NanoPDFExtractor:
         return results
 
     def export(self, data: Dict[str, Any], output_fmt: Literal["json", "md", "both"], output_prefix: str) -> None:
-        """Exports hierarchical extraction results into JSON, Markdown, or both formats.
-
-        Args:
-            data: Structured output payload generated by process_pdf().
-            output_fmt: Desired export format ('json', 'md', or 'both').
-            output_prefix: Output filepath prefix (without extensions).
-        """
+        """Exports hierarchical extraction results to JSON or Markdown, interleaving visual figures inline."""
         if output_fmt in ["json", "both"]:
             with open(f"{output_prefix}.json", "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -293,20 +389,34 @@ class NanoPDFExtractor:
             md_content = ""
             for page in data["pages"]:
                 md_content += f"# Page {page['page_number']}\n\n"
-                md_content += f"## Extracted Text & Footnotes\n\n{page['text']}\n\n"
                 
-                if page.get("native_tables"):
-                    md_content += "## Extracted Native Tables\n\n"
-                    for idx, tbl in enumerate(page["native_tables"]):
-                        md_content += f"### Native Table {idx + 1}\n\n{tbl}\n\n"
-                        
-                if page.get("visual_analysis"):
-                    md_content += "## Extracted Visual Figures & Visual Tables\n\n"
-                    for visual in page["visual_analysis"]:
-                        md_content += f"### Figure {visual['figure_index']}\n\n"
-                        md_content += f"![Page {page['page_number']} Figure {visual['figure_index']}]({visual['image_path']})\n\n"
-                        md_content += f"**Bounding Box (x, y, w, h):** `{visual['bbox']}`\n\n"
-                        md_content += f"{visual['data']}\n\n"
+                # Consolidate all elements for dynamic vertical interleaving
+                elements = []
+                
+                for b in page.get("text_blocks", []):
+                    elements.append({
+                        "y": b["bbox"][1], 
+                        "content": b["text"]
+                    })
+                    
+                for idx, visual in enumerate(page.get("visual_analysis", [])):
+                    img_md = f"### Figure {visual['figure_index']}\n\n"
+                    img_md += f"![Page {page['page_number']} Figure {visual['figure_index']}]({visual['image_path']})\n\n"
+                    img_md += f"**Visual Analysis:**\n{visual['data']}\n"
+                    
+                    elements.append({
+                        "y": visual["bbox"][1],
+                        "content": img_md
+                    })
+
+                # Sort elements based on vertical position (top to bottom)
+                elements.sort(key=lambda item: item["y"])
+                
+                # Render vertically interleaved page output
+                for elem in elements:
+                    md_content += f"{elem['content']}\n\n"
+
+                md_content += "---\n\n"
             
             with open(f"{output_prefix}.md", "w", encoding="utf-8") as f:
                 f.write(md_content)
